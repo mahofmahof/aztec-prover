@@ -1,0 +1,309 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Aztec Prover Rewards Claimer</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; max-width: 980px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 12px 0; }
+    input, button, textarea { padding: 8px; border-radius: 8px; border: 1px solid #ccc; }
+    button { cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+    .muted { color: #666; font-size: 0.92em; }
+    .ok { color: #0a7; font-weight: 600; }
+    .bad { color: #c22; font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 0.92em; }
+  </style>
+</head>
+<body>
+  <h1>Aztec Prover Rewards Claimer</h1>
+  <div class="muted">GitHub Pages static app — private key yok, sadece MetaMask imzalar.</div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="muted">ROLLUP</div>
+        <input id="rollup" size="48" value="0x603bb2c05D474794ea97805e8De69bCcFb3bCA12" />
+      </div>
+      <div>
+        <div class="muted">PROVER (reward owner)</div>
+        <input id="prover" size="48" value="0xB08B2c3099193bCF05f742CCB7f206635Fe243B3" />
+      </div>
+      <div>
+        <div class="muted">Coinbase (claim receiver)</div>
+        <input id="coinbase" size="48" value="0x914fefb97de207dc72fEa09031dD7E7028F513E9" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <div>
+        <div class="muted">RPC (read + estimate)</div>
+        <input id="rpc" size="48" value="https://ethereum-rpc.publicnode.com" />
+      </div>
+      <div>
+        <div class="muted">Epoch range</div>
+        <input id="startEpoch" size="8" value="1" />
+        <input id="endEpoch" size="8" value="4000" />
+      </div>
+      <div>
+        <div class="muted">Batch size</div>
+        <input id="batch" size="6" value="50" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button id="connect">Connect MetaMask</button>
+      <button id="scan">Scan Rewards</button>
+      <button id="estimate" disabled>Estimate Claim Cost</button>
+      <button id="claim" disabled>Claim Selected</button>
+    </div>
+
+    <div class="muted" style="margin-top:10px;">
+      ROI için “Submit Epoch proof fee (avg)” alanını aşağıda gir. (senin listede ~0.00025–0.00040 ETH)
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Summary</h3>
+    <div id="status" class="mono muted">Ready.</div>
+    <div class="row">
+      <div class="card" style="flex:1;">
+        <div class="muted">Total reward (ETH)</div>
+        <div id="totalReward" class="mono">-</div>
+      </div>
+      <div class="card" style="flex:1;">
+        <div class="muted">Estimated claim cost (ETH)</div>
+        <div id="claimCost" class="mono">-</div>
+      </div>
+      <div class="card" style="flex:1;">
+        <div class="muted">Profit check</div>
+        <div id="profit" class="mono">-</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div style="flex:1;">
+        <div class="muted">Avg “Submit Epoch proof” fee per epoch (ETH) — manuel gir</div>
+        <input id="avgSubmitFee" size="12" value="0.00030" />
+      </div>
+      <div style="flex:1;">
+        <div class="muted">Estimated net (reward - submitFees - claimCost)</div>
+        <div id="net" class="mono">-</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Epochs with rewards</h3>
+    <div class="muted">Scan sonrası reward>0 olan epochlar listelenir. Claim etmek istediklerini seç.</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Select</th>
+          <th>Epoch</th>
+          <th>Reward (ETH)</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/+esm";
+
+    const ABI = [
+      "function getSpecificProverRewardsForEpoch(uint256 epoch, address prover) view returns (uint256)",
+      "function claimProverRewards(address _coinbase, uint256[] _epochs)"
+    ];
+
+    const el = (id) => document.getElementById(id);
+    const status = (s) => el("status").textContent = s;
+
+    let providerRead = null;     // JSON-RPC provider for reads
+    let browserProvider = null;  // MetaMask provider
+    let signer = null;
+    let account = null;
+
+    let found = []; // {epoch, wei, eth}
+
+    function toEth(wei) { return Number(ethers.formatEther(wei)); }
+
+    function getSelectedEpochs() {
+      const checks = document.querySelectorAll("input[data-epoch]:checked");
+      return Array.from(checks).map(c => Number(c.getAttribute("data-epoch")));
+    }
+
+    function sumSelectedRewards() {
+      const selected = new Set(getSelectedEpochs());
+      let total = 0;
+      for (const r of found) if (selected.has(r.epoch)) total += r.eth;
+      return total;
+    }
+
+    function renderRows() {
+      const tbody = el("rows");
+      tbody.innerHTML = "";
+      for (const r of found) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><input type="checkbox" data-epoch="${r.epoch}" checked /></td>
+          <td class="mono">${r.epoch}</td>
+          <td class="mono">${r.eth.toFixed(8)}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+      // on change update summary
+      tbody.querySelectorAll("input[type=checkbox]").forEach(cb => {
+        cb.addEventListener("change", () => updateSummary());
+      });
+    }
+
+    function updateSummary(claimCostEth = null) {
+      const totalReward = sumSelectedRewards();
+      el("totalReward").textContent = totalReward ? totalReward.toFixed(8) : "-";
+
+      const avgSubmit = Number(el("avgSubmitFee").value || "0");
+      const submitFees = avgSubmit * getSelectedEpochs().length;
+
+      if (claimCostEth != null) {
+        el("claimCost").textContent = claimCostEth.toFixed(8);
+        const net = totalReward - submitFees - claimCostEth;
+        el("net").textContent = (net).toFixed(8);
+
+        if (net > 0) {
+          el("profit").innerHTML = `<span class="ok">NET +${net.toFixed(8)} ETH</span>`;
+        } else {
+          el("profit").innerHTML = `<span class="bad">NET ${net.toFixed(8)} ETH</span>`;
+        }
+      } else {
+        el("claimCost").textContent = "-";
+        el("net").textContent = "-";
+        el("profit").textContent = "-";
+      }
+    }
+
+    async function initReadProvider() {
+      const rpc = el("rpc").value.trim();
+      providerRead = new ethers.JsonRpcProvider(rpc);
+      return providerRead;
+    }
+
+    el("connect").addEventListener("click", async () => {
+      if (!window.ethereum) {
+        alert("MetaMask bulunamadı.");
+        return;
+      }
+      browserProvider = new ethers.BrowserProvider(window.ethereum);
+      await browserProvider.send("eth_requestAccounts", []);
+      signer = await browserProvider.getSigner();
+      account = await signer.getAddress();
+      status("Connected: " + account);
+      el("estimate").disabled = false;
+      el("claim").disabled = false;
+    });
+
+    el("scan").addEventListener("click", async () => {
+      try {
+        status("Preparing provider...");
+        await initReadProvider();
+
+        const rollup = el("rollup").value.trim();
+        const prover = el("prover").value.trim();
+        const startEpoch = Number(el("startEpoch").value);
+        const endEpoch = Number(el("endEpoch").value);
+        const batch = Math.max(1, Number(el("batch").value));
+
+        const c = new ethers.Contract(rollup, ABI, providerRead);
+
+        found = [];
+        status(`Scanning ${startEpoch}..${endEpoch} (batch=${batch}) ...`);
+
+        for (let i = startEpoch; i <= endEpoch; i += batch) {
+          const hi = Math.min(endEpoch, i + batch - 1);
+          const calls = [];
+          for (let e = i; e <= hi; e++) {
+            calls.push(c.getSpecificProverRewardsForEpoch(e, prover));
+          }
+          const res = await Promise.all(calls);
+          for (let idx = 0; idx < res.length; idx++) {
+            const epoch = i + idx;
+            const wei = res[idx];
+            if (wei !== 0n) {
+              found.push({ epoch, wei, eth: toEth(wei) });
+            }
+          }
+          status(`Scanned up to ${hi}. Found=${found.length}`);
+        }
+
+        found.sort((a,b) => a.epoch - b.epoch);
+        renderRows();
+        updateSummary();
+        status(`Done. Found ${found.length} epochs with rewards.`);
+      } catch (e) {
+        console.error(e);
+        status("Error: " + (e?.message || e));
+      }
+    });
+
+    el("estimate").addEventListener("click", async () => {
+      try {
+        if (!providerRead) await initReadProvider();
+
+        const rollup = el("rollup").value.trim();
+        const coinbase = el("coinbase").value.trim();
+        const epochs = getSelectedEpochs();
+        if (!epochs.length) { alert("Seçili epoch yok."); return; }
+
+        const c = new ethers.Contract(rollup, ABI, providerRead);
+
+        // Estimate gas for claim call
+        status("Estimating gas...");
+        const gas = await c.claimProverRewards.estimateGas(coinbase, epochs);
+
+        // Estimate fee data
+        const fee = await providerRead.getFeeData();
+        // Use maxFeePerGas if present, else fallback to gasPrice
+        const maxFeePerGas = fee.maxFeePerGas ?? fee.gasPrice;
+        if (!maxFeePerGas) throw new Error("Fee data unavailable (maxFeePerGas/gasPrice).");
+
+        const costWei = gas * maxFeePerGas;
+        const costEth = Number(ethers.formatEther(costWei));
+
+        status(`Estimated gas=${gas.toString()} maxFeePerGas=${maxFeePerGas.toString()}`);
+        updateSummary(costEth);
+      } catch (e) {
+        console.error(e);
+        status("Error: " + (e?.message || e));
+      }
+    });
+
+    el("claim").addEventListener("click", async () => {
+      try {
+        if (!signer) { alert("Önce Connect MetaMask."); return; }
+
+        const rollup = el("rollup").value.trim();
+        const coinbase = el("coinbase").value.trim();
+        const epochs = getSelectedEpochs();
+        if (!epochs.length) { alert("Seçili epoch yok."); return; }
+
+        const c = new ethers.Contract(rollup, ABI, signer);
+
+        status("Sending claim tx (MetaMask) ...");
+        const tx = await c.claimProverRewards(coinbase, epochs);
+        status("Tx sent: " + tx.hash);
+
+        const rcpt = await tx.wait();
+        status("Mined ✅: " + rcpt.transactionHash);
+      } catch (e) {
+        console.error(e);
+        status("Error: " + (e?.message || e));
+      }
+    });
+
+    el("avgSubmitFee").addEventListener("input", () => updateSummary());
+  </script>
+</body>
+</html>
